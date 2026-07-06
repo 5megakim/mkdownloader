@@ -1,0 +1,70 @@
+name: Build Tauri Installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS universal DMG
+            os: macos-14
+            rust_targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+            tauri_args: "--target universal-apple-darwin --bundles dmg"
+            artifact_prefix: "MKDownloader-macos-universal"
+
+          - label: Windows x64 NSIS
+            os: windows-2022
+            rust_targets: ""
+            tauri_args: "--bundles nsis"
+            artifact_prefix: "MKDownloader-windows-x64"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: ${{ matrix.os }}-${{ matrix.tauri_args }}
+
+      - name: Install npm dependencies
+        run: npm ci --include=optional
+
+      - name: Build Tauri bundle
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: ${{ matrix.tauri_args }}
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: "${{ matrix.artifact_prefix }}-[version]-[platform]-[arch]-[bundle]"

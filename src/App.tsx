@@ -128,6 +128,9 @@ const VIDEO_URL_EXTRACT = /https?:\/\/[^\s'"<>]*(?:youtube\.com|youtu\.be|tiktok
 // Any HTTP(S) URL — used for "is the URL field a URL at all?" check
 const ANY_URL_RE = /^https?:\/\/\S+/i;
 
+// UI 문구 분기용 (기능 분기는 Rust 백엔드의 cfg가 담당)
+const IS_MAC = navigator.userAgent.includes("Mac");
+
 // Normalize URLs to formats yt-dlp recognizes.
 // SOOP rebrand: .com works in browser but yt-dlp's extractor only matches .co.kr
 function normalizeUrl(input: string): string {
@@ -290,6 +293,8 @@ function App() {
   const [updateDone, setUpdateDone] = useState<string | null>(null);
   const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
   const [appUpdating, setAppUpdating] = useState(false);
+  // macOS: DMG를 열어준 뒤 사용자 수동 교체 안내 (Windows는 설치기 실행 후 앱이 종료됨)
+  const [appUpdateNotice, setAppUpdateNotice] = useState<string | null>(null);
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [advOpen, setAdvOpen] = useState<boolean>(
@@ -819,8 +824,18 @@ function App() {
     setUpdateMsg("준비 중...");
     setError(null);
     try {
-      // 성공하면 설치기가 뜨고 앱은 스스로 종료된다
-      await invoke("install_app_update");
+      // Windows: 설치기가 뜨고 앱은 스스로 종료됨 ("installing")
+      // macOS: 검증된 DMG를 열어주고 사용자가 교체 ("dmg-opened")
+      const result = await invoke<string>("install_app_update");
+      if (result === "dmg-opened") {
+        setAppUpdating(false);
+        setUpdateMsg("");
+        // 배너를 내려서 반복 다운로드 방지 (안내 배너가 대신 뜸)
+        setAppUpdate((prev) => prev && { ...prev, update_available: false });
+        setAppUpdateNotice(
+          "새 버전 DMG를 열었어요. 이 앱을 종료한 뒤, 열린 창에서 앱을 Applications 폴더로 끌어 교체해주세요."
+        );
+      }
     } catch (e) {
       setError(String(e));
       setAppUpdating(false);
@@ -919,7 +934,21 @@ function App() {
               onClick={onUpdateApp}
               disabled={appUpdating}
             >
-              {appUpdating ? updateMsg || "업데이트 중..." : "업데이트"}
+              {appUpdating ? updateMsg || "업데이트 중..." : IS_MAC ? "DMG 열기" : "업데이트"}
+            </button>
+          </section>
+        )}
+        {appUpdateNotice && (
+          <section className="update-banner success">
+            <div className="update-info">
+              <span className="update-icon">📦</span>
+              <div>
+                <div className="update-title">새 버전 설치 준비됨</div>
+                <div className="update-sub">{appUpdateNotice}</div>
+              </div>
+            </div>
+            <button className="btn btn-ghost" onClick={() => setAppUpdateNotice(null)}>
+              닫기
             </button>
           </section>
         )}
@@ -945,7 +974,14 @@ function App() {
             </div>
           </div>
           <div className="setup-meta">
-            <div>📍 설치 경로: <code>%LocalAppData%\com.megakim.youtubedownloader\binaries</code></div>
+            <div>
+              📍 설치 경로:{" "}
+              <code>
+                {IS_MAC
+                  ? "~/Library/Application Support/com.megakim.youtubedownloader/binaries"
+                  : "%LocalAppData%\\com.megakim.youtubedownloader\\binaries"}
+              </code>
+            </div>
             <div>🌐 검증된 공식 오픈소스 릴리즈에서만 다운로드</div>
           </div>
 
@@ -1028,7 +1064,7 @@ function App() {
             onClick={onUpdateApp}
             disabled={appUpdating || isDownloading}
           >
-            {appUpdating ? updateMsg || "업데이트 중..." : "업데이트"}
+            {appUpdating ? updateMsg || "업데이트 중..." : IS_MAC ? "DMG 열기" : "업데이트"}
           </button>
         </section>
       )}
@@ -1050,6 +1086,21 @@ function App() {
             disabled={updating || isDownloading}
           >
             {updating ? updateMsg || "업데이트 중..." : "업데이트"}
+          </button>
+        </section>
+      )}
+
+      {appUpdateNotice && (
+        <section className="update-banner success">
+          <div className="update-info">
+            <span className="update-icon">📦</span>
+            <div>
+              <div className="update-title">새 버전 설치 준비됨</div>
+              <div className="update-sub">{appUpdateNotice}</div>
+            </div>
+          </div>
+          <button className="btn btn-ghost" onClick={() => setAppUpdateNotice(null)}>
+            닫기
           </button>
         </section>
       )}

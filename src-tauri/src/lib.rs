@@ -8,12 +8,135 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-const YT_DLP_EXE_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 const YT_DLP_SUMS_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
 const GITHUB_LATEST_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+#[cfg(windows)]
 const FFMPEG_ZIP_URL: &str = "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip";
 const APP_VERSION_URL: &str = "https://mkvibe.com/megabite/version.json";
 const USER_AGENT: &str = "MK-YT-Downloader";
+
+// ===== 플랫폼 분기 헬퍼 (Windows 동작은 기존 그대로, macOS 분기만 추가) =====
+
+// version.json의 platforms 키 (Windows는 하위호환 위해 계속 app.* 를 읽음)
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const PLATFORM_KEY: &str = "macos-aarch64";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const PLATFORM_KEY: &str = "macos-x86_64";
+
+// 도구 실행파일 이름: Windows는 .exe 붙음, macOS는 없음
+fn tool_name(base: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("{}.exe", base)
+    }
+    #[cfg(not(windows))]
+    {
+        base.to_string()
+    }
+}
+
+// yt-dlp 공식 릴리스 자산 이름 (SHA2-256SUMS 행 이름과 동일)
+fn yt_dlp_asset_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "yt-dlp.exe"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "yt-dlp_macos"
+    }
+}
+
+fn yt_dlp_download_url() -> String {
+    format!(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/{}",
+        yt_dlp_asset_name()
+    )
+}
+
+// macOS ffmpeg/ffprobe: OSXExperts 검증본을 우리 GitHub Releases에 미러한 고정 자산.
+// zip / 추출 실행파일 이중 SHA256 고정 (2026-07-07 업스트림 게시값과 대조검증 + 미러 왕복검증 완료)
+#[cfg(target_os = "macos")]
+struct MacToolSource {
+    url: &'static str,
+    archive_sha256: &'static str,
+    executable_sha256: &'static str,
+    member: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+fn mac_ffmpeg_sources() -> [MacToolSource; 2] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        [
+            MacToolSource {
+                url: "https://github.com/5megakim/mkdownloader/releases/download/ffmpeg-macos-osxexperts-20260707/ffmpeg-8.1-macos-arm64-osxexperts.zip",
+                archive_sha256: "ebb82529562b71170807bbc6b0e7eb4f0b13af8cbb0e085bb9e8f6fe709598ad",
+                executable_sha256: "9a08d61f9328e8164ba560ee7a79958e357307fcfeea6fe626b7d66cdc287028",
+                member: "ffmpeg",
+            },
+            MacToolSource {
+                url: "https://github.com/5megakim/mkdownloader/releases/download/ffmpeg-macos-osxexperts-20260707/ffprobe-8.1-macos-arm64-osxexperts.zip",
+                archive_sha256: "a6640a77d38a6f0527c5b597e599cb36a3427a6931444ed80bc62542421950a1",
+                executable_sha256: "aab17ac7379c1178aaf400c3ef36cdb67db0b75b1a23eeef2cb9f658be8844e6",
+                member: "ffprobe",
+            },
+        ]
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        [
+            MacToolSource {
+                url: "https://github.com/5megakim/mkdownloader/releases/download/ffmpeg-macos-osxexperts-20260707/ffmpeg-8.0-macos-x86_64-osxexperts.zip",
+                archive_sha256: "2d24d22db78c87f394a5822867acd5c5dc5e762cd261a44bd26923f3a5af3e07",
+                executable_sha256: "df3f1e3facdc1ae0ad0bd898cdfb072fbc9641bf47b11f172844525a05db8d11",
+                member: "ffmpeg",
+            },
+            MacToolSource {
+                url: "https://github.com/5megakim/mkdownloader/releases/download/ffmpeg-macos-osxexperts-20260707/ffprobe-8.0-macos-x86_64-osxexperts.zip",
+                archive_sha256: "0b6576104a95c1b39d4939e2df86f8f7cf1d55287ff57da48777d94605d12feb",
+                executable_sha256: "5228e651e2bd67bb55819b27f6138351587b16d2b87446007bf35b7cf930d891",
+                member: "ffprobe",
+            },
+        ]
+    }
+}
+
+// macOS: 받은 바이너리 마무리 — 실행권한 + quarantine 제거 + ad-hoc 서명.
+// 파일 내용이 바뀌므로(codesign) 반드시 SHA256 검증 이후, 최종 rename 이전(임시 파일)에 호출할 것.
+// 실패는 숨기지 않고 에러로 반환한다 (깨진 파일이 "준비 완료"로 남는 것 방지).
+#[cfg(target_os = "macos")]
+fn finalize_mac_binary(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("실행권한 설정 실패: {}", e))?;
+
+    // quarantine 속성이 애초에 없으면 xattr가 실패하는데 그것은 정상
+    let x = std::process::Command::new("xattr")
+        .args(["-dr", "com.apple.quarantine"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("xattr 실행 실패: {}", e))?;
+    if !x.status.success() {
+        let err = String::from_utf8_lossy(&x.stderr).to_string();
+        if !err.contains("No such xattr") {
+            return Err(format!("quarantine 제거 실패: {}", err.trim()));
+        }
+    }
+
+    let c = std::process::Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("codesign 실행 실패: {}", e))?;
+    if !c.status.success() {
+        return Err(format!(
+            "ad-hoc 서명 실패: {}",
+            String::from_utf8_lossy(&c.stderr).trim()
+        ));
+    }
+    Ok(())
+}
 
 // Track the currently-running download process (yt-dlp PID) for cancellation
 static CURRENT_DL_PID: OnceLock<Mutex<Option<u32>>> = OnceLock::new();
@@ -28,20 +151,55 @@ fn set_current_pid(pid: Option<u32>) {
     }
 }
 
+// 프로세스와 그 자식들(yt-dlp가 띄우는 ffmpeg 등)을 통째로 종료.
+// Windows = taskkill /F /T (기존 동작 유지), macOS = process group에 TERM → KILL.
+// 이미 종료된 프로세스(No such process)는 성공으로 취급, 그 외 실패는 에러로 반환.
+async fn terminate_process_tree(pid: u32) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+        cmd.spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // make_command가 새 process group을 만들므로 그룹 전체(-pid) 대상
+        let group = format!("-{}", pid);
+        let term = std::process::Command::new("kill")
+            .args(["-TERM", &group])
+            .output()
+            .map_err(|e| format!("kill 실행 실패: {}", e))?;
+        if !term.status.success() {
+            let err = String::from_utf8_lossy(&term.stderr).to_string();
+            if !err.contains("No such process") {
+                return Err(format!("취소 실패(TERM): {}", err.trim()));
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let killo = std::process::Command::new("kill")
+            .args(["-KILL", &group])
+            .output()
+            .map_err(|e| format!("kill 실행 실패: {}", e))?;
+        if !killo.status.success() {
+            let err = String::from_utf8_lossy(&killo.stderr).to_string();
+            if !err.contains("No such process") {
+                return Err(format!("취소 실패(KILL): {}", err.trim()));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[tauri::command]
 async fn cancel_download() -> Result<bool, String> {
     let pid = dl_pid_state().lock().ok().and_then(|g| *g);
     let Some(pid) = pid else {
         return Ok(false);
     };
-    let mut cmd = std::process::Command::new("taskkill");
-    cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    cmd.spawn().map_err(|e| e.to_string())?;
+    terminate_process_tree(pid).await?;
     set_current_pid(None);
     Ok(true)
 }
@@ -136,12 +294,19 @@ fn make_command(path: PathBuf) -> tokio::process::Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         std_cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 취소 시 자식 프로세스(yt-dlp가 띄우는 ffmpeg 등)까지 그룹 단위로 종료하기 위해
+        // 새 process group의 리더로 실행 (kill -TERM -<pid>)
+        std_cmd.process_group(0);
+    }
     tokio::process::Command::from(std_cmd)
 }
 
 #[tauri::command]
 async fn get_video_info(app: AppHandle, url: String) -> Result<VideoInfo, String> {
-    let yt_dlp = resolve_binary(&app, "yt-dlp.exe")?;
+    let yt_dlp = resolve_binary(&app, &tool_name("yt-dlp"))?;
     let output = make_command(yt_dlp)
         .args(["-j", "--no-warnings", "--no-playlist", &url])
         .output()
@@ -337,7 +502,7 @@ async fn convert_to_prores(
 
     // 진행률 분모는 실제 파일 길이(ffprobe) — 구간 자르기/SponsorBlock으로 원본 메타보다 짧을 수 있음
     let mut total_secs = fallback_duration as f64;
-    let ffprobe = ffmpeg.parent().map(|p| p.join("ffprobe.exe"));
+    let ffprobe = ffmpeg.parent().map(|p| p.join(tool_name("ffprobe")));
     if let Some(fp) = ffprobe.filter(|p| p.exists()) {
         if let Ok(out) = make_command(fp)
             .args([
@@ -476,13 +641,16 @@ async fn download_video(app: AppHandle, opts: DownloadOptions) -> Result<String,
     if opts.format_id.starts_with("premiere-") && opts.split_chapters {
         return Err("Premiere 편집용 형식은 챕터별 분할과 함께 쓸 수 없습니다. 챕터 분할을 끄거나 MP4 형식을 사용해주세요.".into());
     }
-    let yt_dlp = resolve_binary(&app, "yt-dlp.exe")?;
-    let ffmpeg = resolve_binary(&app, "ffmpeg.exe")?;
+    let yt_dlp = resolve_binary(&app, &tool_name("yt-dlp"))?;
+    let ffmpeg = resolve_binary(&app, &tool_name("ffmpeg"))?;
     let ffmpeg_dir = ffmpeg.parent().ok_or("ffmpeg 경로 오류")?.to_path_buf();
 
     let (format_spec, extra_args) = format_args(&opts.format_id);
 
-    let output_template = format!("{}\\%(title)s.%(ext)s", opts.output_dir);
+    let output_template = PathBuf::from(&opts.output_dir)
+        .join("%(title)s.%(ext)s")
+        .to_string_lossy()
+        .to_string();
 
     // Capture downloaded filepath via --print-to-file (NOT --print, which silences stdout)
     let fp_temp = std::env::temp_dir().join(format!(
@@ -716,15 +884,22 @@ async fn download_video(app: AppHandle, opts: DownloadOptions) -> Result<String,
 
 #[tauri::command]
 async fn open_folder(path: String) -> Result<(), String> {
-    let mut cmd = std::process::Command::new("explorer");
-    cmd.arg(&path);
     #[cfg(windows)]
     {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg(&path);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.spawn().map_err(|e| e.to_string())?;
     }
-    cmd.spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -733,15 +908,22 @@ async fn open_url(url: String) -> Result<(), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("URL이 http(s)로 시작해야 합니다".into());
     }
-    let mut cmd = std::process::Command::new("rundll32");
-    cmd.args(["url.dll,FileProtocolHandler", &url]);
     #[cfg(windows)]
     {
+        let mut cmd = std::process::Command::new("rundll32");
+        cmd.args(["url.dll,FileProtocolHandler", &url]);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.spawn().map_err(|e| e.to_string())?;
     }
-    cmd.spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -824,13 +1006,52 @@ async fn fetch_app_version_json() -> Result<serde_json::Value, String> {
         .map_err(|e| format!("버전 정보 파싱 실패: {}", e))
 }
 
+// 플랫폼에 맞는 version.json 항목 선택.
+// Windows는 하위호환(이미 배포된 빌드)을 위해 기존 app.* 를 그대로 읽고,
+// macOS는 platforms.<arch키> → platforms."macos-universal" 순서로 찾는다.
+// arch 항목이 있어도 필수 필드(version/download_url/sha256)가 빠졌으면 universal로 넘어간다.
+#[cfg(target_os = "macos")]
+fn version_entry_complete(e: &serde_json::Value) -> bool {
+    e.is_object()
+        && e["version"].as_str().map_or(false, |s| !s.trim().is_empty())
+        && e["download_url"].as_str().map_or(false, |s| !s.trim().is_empty())
+        && e["sha256"].as_str().map_or(false, |s| !s.trim().is_empty())
+}
+
+fn select_version_entry(json: &serde_json::Value) -> serde_json::Value {
+    #[cfg(windows)]
+    {
+        json["app"].clone()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let p = &json["platforms"];
+        let e = &p[PLATFORM_KEY];
+        if version_entry_complete(e) {
+            e.clone()
+        } else {
+            p["macos-universal"].clone()
+        }
+    }
+}
+
 #[tauri::command]
 async fn check_app_update(app: AppHandle) -> Result<AppUpdateStatus, String> {
     let current = app.package_info().version.clone();
     let json = fetch_app_version_json().await?;
-    let a = &json["app"];
+    let entry = select_version_entry(&json);
+    #[cfg(target_os = "macos")]
+    if !entry.is_object() {
+        // 맥용 배포 항목이 아직 없으면 "업데이트 없음"으로 조용히 처리
+        return Ok(AppUpdateStatus {
+            current_version: current.to_string(),
+            latest_version: current.to_string(),
+            update_available: false,
+            release_notes_url: String::new(),
+        });
+    }
     // "v1.0.2" 표기 방어: 앞의 v는 벗기고 bare semver로 비교
-    let latest_str = a["version"].as_str().unwrap_or("").trim().trim_start_matches('v').to_string();
+    let latest_str = entry["version"].as_str().unwrap_or("").trim().trim_start_matches('v').to_string();
     let latest = semver::Version::parse(&latest_str)
         .map_err(|e| format!("버전 형식 오류({}): {}", latest_str, e))?;
     let update_available = latest > current;
@@ -838,16 +1059,20 @@ async fn check_app_update(app: AppHandle) -> Result<AppUpdateStatus, String> {
         current_version: current.to_string(),
         latest_version: latest_str,
         update_available,
-        release_notes_url: a["release_notes_url"].as_str().unwrap_or("").to_string(),
+        release_notes_url: entry["release_notes_url"].as_str().unwrap_or("").to_string(),
     })
 }
 
 #[tauri::command]
-async fn install_app_update(app: AppHandle) -> Result<(), String> {
+async fn install_app_update(app: AppHandle) -> Result<String, String> {
     // 설치 시점에 version.json을 다시 읽어 최신 URL/해시 기준으로 진행 + 버전 재확인
     let current = app.package_info().version.clone();
     let json = fetch_app_version_json().await?;
-    let a = &json["app"];
+    let a = select_version_entry(&json);
+    #[cfg(target_os = "macos")]
+    if !a.is_object() {
+        return Err("이 플랫폼용 배포 정보가 아직 없습니다".into());
+    }
 
     let latest_str = a["version"].as_str().unwrap_or("").trim().trim_start_matches('v').to_string();
     let latest = semver::Version::parse(&latest_str)
@@ -857,7 +1082,12 @@ async fn install_app_update(app: AppHandle) -> Result<(), String> {
     }
 
     let download_url = a["download_url"].as_str().unwrap_or("").to_string();
+    #[cfg(windows)]
     if !download_url.starts_with("https://mkvibe.com/") || !download_url.to_lowercase().ends_with(".exe") {
+        return Err(format!("허용되지 않는 다운로드 주소입니다: {}", download_url));
+    }
+    #[cfg(target_os = "macos")]
+    if !download_url.starts_with("https://mkvibe.com/") || !download_url.to_lowercase().ends_with(".dmg") {
         return Err(format!("허용되지 않는 다운로드 주소입니다: {}", download_url));
     }
 
@@ -897,42 +1127,56 @@ async fn install_app_update(app: AppHandle) -> Result<(), String> {
     }
 
     // 파일명은 URL 마지막 조각에서 안전한 문자만 취한다
+    #[cfg(windows)]
+    const INSTALLER_EXT: &str = ".exe";
+    #[cfg(target_os = "macos")]
+    const INSTALLER_EXT: &str = ".dmg";
     let raw_name = download_url.rsplit('/').next().unwrap_or("");
     let mut file_name: String = raw_name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
         .collect();
-    if !file_name.to_lowercase().ends_with(".exe") {
-        file_name = "MKDownloader-setup.exe".into();
+    if !file_name.to_lowercase().ends_with(INSTALLER_EXT) {
+        file_name = format!("MKDownloader-setup{}", INSTALLER_EXT);
     }
     let installer_path = std::env::temp_dir().join(&file_name);
     tokio::fs::write(&installer_path, &bytes)
         .await
         .map_err(|e| format!("설치 파일 저장 실패: {}", e))?;
 
-    let _ = app.emit("update-progress", "설치 프로그램 실행 중...");
-    // 실행 중인 exe를 설치기가 건드리는 레이스를 피하기 위해,
-    // 헬퍼(powershell)가 현재 프로세스 종료를 기다린 뒤 설치기를 띄운다
-    let current_pid = std::process::id();
-    // PS 단일따옴표 문자열 이스케이프: ' → '' (경로에 따옴표가 든 드문 환경 방어)
-    let installer_path_ps = installer_path.display().to_string().replace('\'', "''");
-    let script = format!(
-        "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath '{}'",
-        current_pid, installer_path_ps
-    );
-    let mut cmd = std::process::Command::new("powershell");
-    cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
     #[cfg(windows)]
     {
+        let _ = app.emit("update-progress", "설치 프로그램 실행 중...");
+        // 실행 중인 exe를 설치기가 건드리는 레이스를 피하기 위해,
+        // 헬퍼(powershell)가 현재 프로세스 종료를 기다린 뒤 설치기를 띄운다
+        let current_pid = std::process::id();
+        // PS 단일따옴표 문자열 이스케이프: ' → '' (경로에 따옴표가 든 드문 환경 방어)
+        let installer_path_ps = installer_path.display().to_string().replace('\'', "''");
+        let script = format!(
+            "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process -FilePath '{}'",
+            current_pid, installer_path_ps
+        );
+        let mut cmd = std::process::Command::new("powershell");
+        cmd.args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script]);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.spawn().map_err(|e| format!("설치 헬퍼 실행 실패: {}", e))?;
+        cmd.spawn().map_err(|e| format!("설치 헬퍼 실행 실패: {}", e))?;
 
-    // 앱을 종료하면 헬퍼가 설치기를 실행한다
-    app.exit(0);
-    Ok(())
+        // 앱을 종료하면 헬퍼가 설치기를 실행한다
+        app.exit(0);
+        Ok("installing".into())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS는 자동 교체하지 않는다 — 검증된 DMG를 열어주고 사용자가 교체 (codex 협의 결정)
+        let _ = app.emit("update-progress", "DMG 여는 중...");
+        std::process::Command::new("open")
+            .arg(&installer_path)
+            .spawn()
+            .map_err(|e| format!("DMG 열기 실패: {}", e))?;
+        Ok("dmg-opened".into())
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -944,7 +1188,7 @@ struct UpdateStatus {
 
 #[tauri::command]
 async fn check_yt_dlp_update(app: AppHandle) -> Result<UpdateStatus, String> {
-    let yt_dlp = resolve_binary(&app, "yt-dlp.exe")?;
+    let yt_dlp = resolve_binary(&app, &tool_name("yt-dlp"))?;
     let output = make_command(yt_dlp)
         .arg("--version")
         .output()
@@ -979,7 +1223,7 @@ async fn check_yt_dlp_update(app: AppHandle) -> Result<UpdateStatus, String> {
 
 #[tauri::command]
 async fn update_yt_dlp(app: AppHandle) -> Result<String, String> {
-    let yt_dlp_path = resolve_binary(&app, "yt-dlp.exe")?;
+    let yt_dlp_path = resolve_binary(&app, &tool_name("yt-dlp"))?;
 
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -1001,15 +1245,15 @@ async fn update_yt_dlp(app: AppHandle) -> Result<String, String> {
         .lines()
         .find(|l| {
             let parts: Vec<&str> = l.split_whitespace().collect();
-            parts.len() == 2 && parts[1] == "yt-dlp.exe"
+            parts.len() == 2 && parts[1] == yt_dlp_asset_name()
         })
         .and_then(|l| l.split_whitespace().next())
-        .ok_or("SHA256SUMS에서 yt-dlp.exe 항목을 찾을 수 없습니다")?
+        .ok_or("SHA256SUMS에서 다운로드 엔진 항목을 찾을 수 없습니다")?
         .to_lowercase();
 
     let _ = app.emit("update-progress", "엔진 다운로드 중...");
     let bytes = client
-        .get(YT_DLP_EXE_URL)
+        .get(&yt_dlp_download_url())
         .send()
         .await
         .map_err(|e| format!("엔진 다운로드 실패: {}", e))?
@@ -1034,6 +1278,12 @@ async fn update_yt_dlp(app: AppHandle) -> Result<String, String> {
     tokio::fs::write(&temp_path, &bytes)
         .await
         .map_err(|e| format!("임시 파일 쓰기 실패: {}", e))?;
+    // macOS: 교체 전에 임시 파일 상태에서 마무리 (실패 시 기존 파일 보존)
+    #[cfg(target_os = "macos")]
+    if let Err(e) = finalize_mac_binary(&temp_path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(e);
+    }
     tokio::fs::rename(&temp_path, &yt_dlp_path)
         .await
         .map_err(|e| format!("파일 교체 실패 (다운로드 중이면 종료 후 다시 시도): {}", e))?;
@@ -1064,9 +1314,9 @@ struct SetupProgress {
 #[tauri::command]
 async fn check_binaries_ready(app: AppHandle) -> Result<bool, String> {
     let bin = binaries_dir(&app)?;
-    Ok(bin.join("yt-dlp.exe").exists()
-        && bin.join("ffmpeg.exe").exists()
-        && bin.join("ffprobe.exe").exists())
+    Ok(bin.join(tool_name("yt-dlp")).exists()
+        && bin.join(tool_name("ffmpeg")).exists()
+        && bin.join(tool_name("ffprobe")).exists())
 }
 
 async fn download_with_progress(
@@ -1140,9 +1390,9 @@ async fn setup_binaries(app: AppHandle) -> Result<String, String> {
     let bin = binaries_dir(&app)?;
     std::fs::create_dir_all(&bin).map_err(|e| e.to_string())?;
 
-    let yt_path = bin.join("yt-dlp.exe");
-    let ffmpeg_path = bin.join("ffmpeg.exe");
-    let ffprobe_path = bin.join("ffprobe.exe");
+    let yt_path = bin.join(tool_name("yt-dlp"));
+    let ffmpeg_path = bin.join(tool_name("ffmpeg"));
+    let ffprobe_path = bin.join(tool_name("ffprobe"));
 
     if !yt_path.exists() {
         let client = reqwest::Client::builder()
@@ -1174,17 +1424,17 @@ async fn setup_binaries(app: AppHandle) -> Result<String, String> {
             .lines()
             .find(|l| {
                 let p: Vec<&str> = l.split_whitespace().collect();
-                p.len() == 2 && p[1] == "yt-dlp.exe"
+                p.len() == 2 && p[1] == yt_dlp_asset_name()
             })
             .and_then(|l| l.split_whitespace().next())
-            .ok_or("SHA256SUMS에서 yt-dlp.exe 항목을 찾을 수 없음")?
+            .ok_or("SHA256SUMS에서 다운로드 엔진 항목을 찾을 수 없음")?
             .to_lowercase();
 
         // Use a temp file in the same directory as the destination to avoid
         // ERROR_NOT_SAME_DEVICE (os error 17) when %TEMP% and %LocalAppData% are on different drives
-        let temp_yt = bin.join("yt-dlp.exe.tmp");
+        let temp_yt = bin.join(format!("{}.tmp", tool_name("yt-dlp")));
         let _ = std::fs::remove_file(&temp_yt);
-        download_with_progress(&app, YT_DLP_EXE_URL, &temp_yt, "yt-dlp", "다운로드 엔진").await?;
+        download_with_progress(&app, &yt_dlp_download_url(), &temp_yt, "yt-dlp", "다운로드 엔진").await?;
 
         let bytes = tokio::fs::read(&temp_yt).await.map_err(|e| e.to_string())?;
         let mut hasher = Sha256::new();
@@ -1197,11 +1447,18 @@ async fn setup_binaries(app: AppHandle) -> Result<String, String> {
                 expected_hash, actual
             ));
         }
+        // macOS: 최종 위치로 옮기기 전에 임시 파일 상태에서 마무리 (실패 시 최종 파일이 안 생기게)
+        #[cfg(target_os = "macos")]
+        if let Err(e) = finalize_mac_binary(&temp_yt) {
+            let _ = std::fs::remove_file(&temp_yt);
+            return Err(e);
+        }
         tokio::fs::rename(&temp_yt, &yt_path)
             .await
             .map_err(|e| e.to_string())?;
     }
 
+    #[cfg(windows)]
     if !ffmpeg_path.exists() || !ffprobe_path.exists() {
         // Same-drive temp to avoid cross-drive rename failures
         let temp_zip = bin.join("ffmpeg.zip.tmp");
@@ -1326,6 +1583,100 @@ async fn setup_binaries(app: AppHandle) -> Result<String, String> {
 
         if !ffmpeg_path.exists() || !ffprobe_path.exists() {
             return Err("ffmpeg/ffprobe 추출 실패 (zip 안에서 못 찾음)".into());
+        }
+    }
+
+    // macOS: 우리 GitHub Releases 미러(OSXExperts 검증본)에서 도구별 zip을 받아
+    // zip 해시 → 추출 → 실행파일 해시 이중 검증 후 설치
+    #[cfg(target_os = "macos")]
+    if !ffmpeg_path.exists() || !ffprobe_path.exists() {
+        for src in mac_ffmpeg_sources() {
+            let dest = bin.join(src.member);
+            if dest.exists() {
+                continue;
+            }
+            let temp_zip = bin.join(format!("{}.zip.tmp", src.member));
+            let _ = std::fs::remove_file(&temp_zip);
+            download_with_progress(
+                &app,
+                src.url,
+                &temp_zip,
+                "ffmpeg",
+                &format!("{} 압축 파일", src.member),
+            )
+            .await?;
+
+            let zbytes = tokio::fs::read(&temp_zip).await.map_err(|e| e.to_string())?;
+            let mut h = Sha256::new();
+            h.update(&zbytes);
+            let zhash = hex::encode(h.finalize());
+            if zhash != src.archive_sha256 {
+                let _ = std::fs::remove_file(&temp_zip);
+                return Err(format!(
+                    "{} 압축 파일 체크섬 불일치 (변조 의심)\n예상: {}\n실제: {}",
+                    src.member, src.archive_sha256, zhash
+                ));
+            }
+
+            let _ = app.emit(
+                "setup-progress",
+                SetupProgress {
+                    step: "extract".into(),
+                    percent: 0.0,
+                    downloaded_mb: 0.0,
+                    total_mb: 0.0,
+                    message: format!("{} 압축 해제 중...", src.member),
+                },
+            );
+
+            let member = src.member.to_string();
+            let exe_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+                use std::io::Read;
+                let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zbytes))
+                    .map_err(|e| e.to_string())?;
+                let names: Vec<String> = archive.file_names().map(|s| s.to_string()).collect();
+                let found = names
+                    .iter()
+                    .find(|n| **n == member || n.ends_with(&format!("/{}", member)))
+                    .cloned()
+                    .ok_or(format!("zip에서 {} 를 찾을 수 없음", member))?;
+                let mut entry = archive.by_name(&found).map_err(|e| e.to_string())?;
+                let mut out = Vec::with_capacity(entry.size() as usize);
+                entry.read_to_end(&mut out).map_err(|e| e.to_string())?;
+                Ok(out)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+
+            let mut h2 = Sha256::new();
+            h2.update(&exe_bytes);
+            let ehash = hex::encode(h2.finalize());
+            if ehash != src.executable_sha256 {
+                let _ = std::fs::remove_file(&temp_zip);
+                return Err(format!(
+                    "{} 실행파일 체크섬 불일치 (변조 의심)\n예상: {}\n실제: {}",
+                    src.member, src.executable_sha256, ehash
+                ));
+            }
+
+            // 임시 파일에 쓰고 → 마무리(chmod/xattr/codesign) → 원자적 rename
+            let dest_tmp = bin.join(format!("{}.bin.tmp", src.member));
+            let _ = std::fs::remove_file(&dest_tmp);
+            tokio::fs::write(&dest_tmp, &exe_bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+            if let Err(e) = finalize_mac_binary(&dest_tmp) {
+                let _ = std::fs::remove_file(&dest_tmp);
+                let _ = std::fs::remove_file(&temp_zip);
+                return Err(e);
+            }
+            tokio::fs::rename(&dest_tmp, &dest)
+                .await
+                .map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(&temp_zip);
+        }
+        if !ffmpeg_path.exists() || !ffprobe_path.exists() {
+            return Err("ffmpeg/ffprobe 설치 실패".into());
         }
     }
 
@@ -1460,8 +1811,8 @@ fn fmt_time(sec: f64) -> String {
 
 #[tauri::command]
 async fn generate_shorts(app: AppHandle, opts: ShortsOptions) -> Result<String, String> {
-    let yt_dlp = resolve_binary(&app, "yt-dlp.exe")?;
-    let ffmpeg = resolve_binary(&app, "ffmpeg.exe")?;
+    let yt_dlp = resolve_binary(&app, &tool_name("yt-dlp"))?;
+    let ffmpeg = resolve_binary(&app, &tool_name("ffmpeg"))?;
     let ffmpeg_dir = ffmpeg.parent().ok_or("ffmpeg 경로 오류")?.to_path_buf();
 
     let emit_progress = |percent: f64, status: &str, message: String, speed: String, eta: String, total_size: String| {
@@ -1645,7 +1996,14 @@ async fn generate_shorts(app: AppHandle, opts: ShortsOptions) -> Result<String, 
     let dl_status = match wait_result {
         Ok(r) => r.map_err(|e| e.to_string())?,
         Err(_) => {
-            let _ = dl_child.kill().await;
+            // 자식(ffmpeg 등)까지 트리로 종료 — 실패 시 최후수단으로 직접 kill
+            if let Some(pid) = dl_child.id() {
+                if terminate_process_tree(pid).await.is_err() {
+                    let _ = dl_child.kill().await;
+                }
+            } else {
+                let _ = dl_child.kill().await;
+            }
             let _ = std::fs::remove_file(&temp_full);
             return Err(format!(
                 "원본 다운로드 {}분 초과 (네트워크/yt-dlp 응답 없음)",
