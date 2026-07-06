@@ -1,5 +1,13 @@
 # MK 유튜브 다운로더 — Basic 모델
 
+## v1.0.2 macOS 지원 추가 (2026-07-07)
+
+- **macOS 포팅**: Intel/Apple Silicon universal DMG (macOS 10.15+, 무서명 — 첫 실행 시 우클릭→열기)
+- yt-dlp는 공식 `yt-dlp_macos`, ffmpeg/ffprobe는 검증본 미러(GitHub Releases, zip+실행파일 이중 SHA-256)
+- 맥 앱 업데이트는 DMG 다운로드+검증 후 열어주는 방식 (수동 교체)
+- version.json `platforms` 스키마 도입 (Windows 하위호환 유지)
+- GitHub Actions CI 빌드 (`5megakim/mkdownloader`)
+
 ## v1.0.2 (2026-07-06) 마이너 업데이트
 
 1. **✂️ Premiere 편집용 형식 추가**: 최고화질(AV1 포함) 그대로 받은 뒤 프리미어 프로가 지원하는 MOV(ProRes 422 HQ + PCM 48kHz)로 자동 변환. 화질 보존·용량 큼. 자막은 임베드 대신 외부 SRT 저장.
